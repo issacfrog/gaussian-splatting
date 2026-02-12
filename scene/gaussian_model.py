@@ -46,23 +46,22 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
-
     def __init__(self, sh_degree, optimizer_type="default"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
-        self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
-        self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
-        self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
-        self.denom = torch.empty(0)
-        self.optimizer = None
-        self.percent_dense = 0
-        self.spatial_lr_scale = 0
+        self._xyz = torch.empty(0)                                     # 高斯球的位置
+        self._features_dc = torch.empty(0)                             # 每个高斯的Direct Current，低频、基础颜色量等
+        self._features_rest = torch.empty(0)                           # 随视角变化的颜色细节
+        self._scaling = torch.empty(0)                                 # 高斯球的尺度，实际上是对应的高斯球的三个轴向的大小
+        self._rotation = torch.empty(0)                                # 高斯球的旋转
+        self._opacity = torch.empty(0)                                 # 高斯球的透明度
+        self.max_radii2D = torch.empty(0)                              # 高斯球的最大半径
+        self.xyz_gradient_accum = torch.empty(0)                       # 高斯球的位置梯度累积 梯度累积到一定程度则进行裂变
+        self.denom = torch.empty(0)                                    # 高斯球的分母
+        self.optimizer = None                                          # 优化器
+        self.percent_dense = 0                                         # 高斯球允许裂变的次数，每次对于所有的高斯球，有多少比例的可以裂变
+        self.spatial_lr_scale = 0                                      # 空间学习率缩放
         self.setup_functions()
 
     def capture(self):
@@ -146,35 +145,81 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
+    # 从sfm系数点云初始化所有科学系的高斯参数
+    def create_from_pcd(self, pcd: BasicPointCloud, cam_infos: int, spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
+
+        # ========= ① 下采样防止 OOM =========
+        points_np = np.asarray(pcd.points)
+        colors_np = np.asarray(pcd.colors)
+
+        max_points = 45000   # 🔥 可以改成 40000 如果你是 12GB 显存
+        if points_np.shape[0] > max_points:
+            print(f"Downsampling point cloud from {points_np.shape[0]} to {max_points}")
+            idx = np.random.choice(points_np.shape[0], max_points, replace=False)
+            points_np = points_np[idx]
+            colors_np = colors_np[idx]
+
+        # ========= ② 转 CUDA =========
+        fused_point_cloud = torch.tensor(points_np).float().cuda()
+        fused_color = RGB2SH(torch.tensor(colors_np).float().cuda())
+
+        # ========= ③ 构造 SH 特征 =========
+        features = torch.zeros(
+            (fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2),
+            dtype=torch.float,
+            device="cuda"
+        )
+        features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        print("Number of points at initialisation:", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        # ========= ④ 计算 scale =========
+        dist2 = torch.clamp_min(
+            distCUDA2(fused_point_cloud),
+            0.0000001
+        )
+
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+
+        # ========= ⑤ 旋转 =========
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        # ========= ⑥ 不透明度 =========
+        opacities = self.inverse_opacity_activation(
+            0.1 * torch.ones((fused_point_cloud.shape[0], 1),
+                            dtype=torch.float,
+                            device="cuda")
+        )
 
+        # ========= ⑦ 注册可学习参数 =========
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(
+            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._features_rest = nn.Parameter(
+            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True)
+        )
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
+
+        self.exposure_mapping = {
+            cam_info.image_name: idx
+            for idx, cam_info in enumerate(cam_infos)
+        }
+
         self.pretrained_exposures = None
+
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
+
+    # 参数初始化
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -189,10 +234,12 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
+        # 选择优化器
         if self.optimizer_type == "default":
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         elif self.optimizer_type == "sparse_adam":
             try:
+                # 使用SparseGaussianAdam的目的是指对课件高斯进行更新，在大场景下能够加速
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
                 # A special version of the rasterizer is required to enable sparse adam
@@ -200,6 +247,7 @@ class GaussianModel:
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
+        # 这里实际上是传递的是一个函数
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -210,18 +258,21 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+    # 预训练的曝光
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
-
+        # 注意这里参数更新的逻辑，学习率是通过一个闭包函数根据迭代次数计算的
+        # 整体上闭包和lambda表达式会有些类似
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
 
+    # 本质上等于通过vector来表示高斯球的所有参数
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         # All channels except the 3 DC
@@ -236,30 +287,43 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
+    # 保存ply文件
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 
-        xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
+        # _xyz 表示GPU上面的学习参数，detach()表示将参数从计算图中分离出来，
+        # cpu()表示将数据搬到CPU，numpy()表示将参数转换为numpy数组
+        xyz = self._xyz.detach().cpu().numpy() 
+        normals = np.zeros_like(xyz) # 创建一个与xyz形状相同的全零数组
+        # _features_dc 表示GPU上面的学习参数，detach()表示将参数从计算图中分离出来，
+        # transpose(1, 2)表示将第二个和第三个维度交换，flatten(start_dim=1)表示将第二个维度展平，
+        # 这里通过transpose调整顺序应该就是为了保证数据按照一定顺序存储
+        # contiguous()表示将数据连续化，cpu()表示将数据搬到CPU，numpy()表示将参数转换为numpy数组
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
+        # 使用f4的单精格式用于节省内存
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
-
+        # 创建结构话数组，将数据等存储到数组中
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
+        # 将结构化数组转为
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
     def reset_opacity(self):
+        # 将透明度进行限制
+        # inverse_opacity_activation 将0~1的不透明度转换回优化参数
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        # 将优化器中的opacity参数从优化器中移除，并替换为新的
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
+    # 加载ply文件   
     def load_ply(self, path, use_train_test_exp = False):
         plydata = PlyData.read(path)
         if use_train_test_exp:

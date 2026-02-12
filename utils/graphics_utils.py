@@ -14,8 +14,9 @@ import math
 import numpy as np
 from typing import NamedTuple
 
+# 基础点云结构 点 颜色 朝向
 class BasicPointCloud(NamedTuple):
-    points : np.array
+    points : np.array 
     colors : np.array
     normals : np.array
 

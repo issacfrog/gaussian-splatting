@@ -153,7 +153,7 @@ class GaussianModel:
         points_np = np.asarray(pcd.points)
         colors_np = np.asarray(pcd.colors)
 
-        max_points = 45000   # 🔥 可以改成 40000 如果你是 12GB 显存
+        max_points = 60000   # 🔥 可以改成 40000 如果你是 12GB 显存
         if points_np.shape[0] > max_points:
             print(f"Downsampling point cloud from {points_np.shape[0]} to {max_points}")
             idx = np.random.choice(points_np.shape[0], max_points, replace=False)
@@ -166,7 +166,7 @@ class GaussianModel:
 
         # ========= ③ 构造 SH 特征 =========
         features = torch.zeros(
-            (fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2),
+            (fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2), # 注意因为这里是平方，所以对于点过多的情况，这里显存会不够用
             dtype=torch.float,
             device="cuda"
         )

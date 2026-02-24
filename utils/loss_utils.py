@@ -63,7 +63,16 @@ def ssim(img1, img2, window_size=11, size_average=True):
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
-# TODO 
+# SSIM Structural Similarity Index Measure 结构相似性指数测量
+# 背后的原理是人眼更关注的是结构上的相似性，而非逐像素的比对
+# 单纯的L1 Loss和L2 Loss存在的问题
+# 1.对亮度敏感
+# 2.不关注结构
+# 3.容易产生模糊
+# SSIM将整个图像分解为三个部分：亮度、对比度和结构
+# 1.亮度：图像的平均亮度 通过均值来描述
+# 2.对比度：图像的对比度 通过方差来描述
+# 3.结构：图像的结构    通过协方差来描述
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)

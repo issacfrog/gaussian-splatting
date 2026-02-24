@@ -135,6 +135,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         # 实际渲染的函数
+        # render通过pybind绑定到cuda函数上，在cuda中完成加速，具体实现细节这里暂时没进一步查看
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -211,12 +212,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
+                # 为了拟合图像，会有一些透明的虚影球体加入，需要定期有删除的机制
+                # 对于透明的区域，拟合一个高斯球，本身对于整体的loss来说是能够起到平均作用的
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity() #定期重置透明度
 
             # 8) 参数更新：先更新曝光参数，再更新高斯参数
             if iteration < opt.iterations:
                 # exposure_optimizer用来优化每张图像曝光参数的的优化器
+                # 参数矩阵式3*4,其中3*3对应了颜色的线性变换（曝光+白平衡+ISP颜色矩阵）
+                # 3*1对应黑电平偏移 关于黑电平的偏移是指完全遮光的情况下的电平输出，由传感器物理特性决定
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 # 两种方式，一种是全部的参数都进行更新，一种是只更新可见的高斯点

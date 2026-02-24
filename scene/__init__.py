@@ -18,6 +18,7 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
+# 场景数据的管理 是训练与循环的：“数据与状态入口” 
 class Scene:
 
     gaussians : GaussianModel

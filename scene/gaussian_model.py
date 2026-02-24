@@ -377,21 +377,27 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+    # 以name为索引，找到指定优化器中的对应的参数动量进行清零
+    # 并且将tensor的值替换掉它
+    # 而后将这个索引对应的tensor返回
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == name:
-                stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                stored_state = self.optimizer.state.get(group['params'][0], None) # 取出旧参数的优化器状态
+                stored_state["exp_avg"] = torch.zeros_like(tensor)      # 历史梯度的滑动平均 清零
+                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)   # 历史梯度平方的滑动平均 清零
 
                 del self.optimizer.state[group['params'][0]]
+                # 在pytorch中，模型的参数必须是nn.Parameter类型，这样才能被优化器优化
                 group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
+    # 优化器剪枝 配合高斯点剪枝来结合使用的
+    # mask是一个类似bitset的向量，根据向量里面的值进行对应的处理
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -410,10 +416,12 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
+    # 点的剪枝 配合优化器剪枝来结合使用的
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        # 执行剪枝
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
-
+        # 替换值
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -421,12 +429,16 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # pytorch 中的mask语法
+        # x[mask] 属于高级索引，会返回一个新张量且只保留 mask = True的元素/行
+        # Python 变量绑定（name rebinding）
+        # self.denom = self.denom[mask] 不是“原地改原对象”，而是把 self.denom 这个名字重新绑定到新张量对象上。
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
+    # 给每组参数追加新的点
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -434,7 +446,7 @@ class GaussianModel:
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-
+                # torch.cat 矩阵拼接操作
                 stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
@@ -449,7 +461,9 @@ class GaussianModel:
 
         return optimizable_tensors
 
+    # 新增高斯点之后的统一收尾函数 与prune_points对应的逆向处理
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+        # 将传入的参数打包
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -470,19 +484,25 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    # 对大的高斯点做分裂操作
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
-        padded_grad[:grads.shape[0]] = grads.squeeze()
+        padded_grad[:grads.shape[0]] = grads.squeeze() # 代码维度上面的操作
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        # 逻辑与操作 梯度大，且高斯球本身的大小大于一定值，这里的值由场景范围的比例来决定
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
+        # 对于每个选中的点，进行高斯球的扩充处理，扩充为N个高斯球，也即进行了分裂操作
+        # 值得注意的是分裂之后的朝向与原球的朝向保持一致（是否是有个大致朝向比没有朝向要好？）
+        # 沿着方差大的方向进行分裂的会多一些，方差大本身也就表征了这个方向上的表征不是很足
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
+        samples = torch.normal(mean=means, std=stds) # 从正态分布中进行采样
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        # bmm执行批量矩阵相乘操作
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
@@ -493,9 +513,12 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
+        # 将旧点和新点组成一个mask传递给prune_points执行旧点的删除与新点的创建工作
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
+    # 对小的高斯点做分裂操作
+    # 小尺度但是梯度大的点使用clone操作，靠后续的训练逐渐来进行区分
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
@@ -513,25 +536,29 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
+    # 整体后处理
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
-        grads = self.xyz_gradient_accum / self.denom
+        grads = self.xyz_gradient_accum / self.denom # 计算每个点的平均梯度
         grads[grads.isnan()] = 0.0
 
+        # 复制&分裂操作
         self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        # 剪枝操作
+        prune_mask = (self.get_opacity < min_opacity).squeeze() # 剔除掉过于透明的高斯点
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent   # 剔除掉剩余的过大的高斯
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+        self.prune_points(prune_mask) # 执行剪枝操作
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
 
+    # 累积量的统计
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
